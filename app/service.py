@@ -74,6 +74,51 @@ def _existing_partition(conn: psycopg.Connection, month_start: date) -> str | No
     return None
 
 
+def _offline_month_table(conn: psycopg.Connection, month_start: date) -> str | None:
+    """Name of a detached (offline) table still holding the month's rows.
+
+    After a manual ``ALTER TABLE alarm DETACH PARTITION`` the table keeps its
+    standard name ``alarm_p_YYYYMM`` but no longer inherits from ``alarm``.
+    Such a table is exactly what a same-month re-attach has to reinstall; it is
+    *not* an attached partition (see :func:`_existing_partition`).
+    """
+    name = partition_name(month_start)
+    exists = conn.execute("SELECT to_regclass(%s) AS name", (name,)).fetchone()["name"]
+    if not exists:
+        return None
+    attached = conn.execute(
+        """
+        SELECT 1
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        WHERE i.inhparent = 'alarm'::regclass AND c.relname = %s
+        """,
+        (name,),
+    ).fetchone()
+    return None if attached else name
+
+
+def _table_index_names(conn: psycopg.Connection, table: str) -> list[str]:
+    """Index names (including constraint-backed ones) of a table."""
+    return [
+        row["indexname"]
+        for row in conn.execute(
+            "SELECT indexname FROM pg_indexes"
+            " WHERE schemaname = 'public' AND tablename = %s",
+            (table,),
+        ).fetchall()
+    ]
+
+
+def _offline_rows(conn: psycopg.Connection, table: str) -> list[dict]:
+    return conn.execute(
+        sql.SQL(
+            "SELECT alarm_no, occurred_at, warehouse_no, temperature, source"
+            " FROM {}"
+        ).format(sql.Identifier(table))
+    ).fetchall()
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -265,12 +310,20 @@ def month_storage(month_start: date) -> str:
             """,
             (month_start,),
         ).fetchone()
+        name = partition_name(month_start)
+        offline = _offline_month_table(conn, month_start)
         if row:
+            if offline:
+                # Rows currently come from the default partition while the
+                # detached table waits to be reinstalled by a re-attach.
+                return row["storage"] + "（另有离线月表 " + name + " 待重挂）"
             return row["storage"]
+        if offline:
+            return name + "（离线，待重挂）"
         if conn.execute(
-            "SELECT to_regclass(%s) AS name", (partition_name(month_start),)
+            "SELECT to_regclass(%s) AS name", (name,)
         ).fetchone()["name"]:
-            return partition_name(month_start) + "（空）"
+            return name + "（空）"
         return "alarm_default"
 
 
@@ -383,6 +436,8 @@ def _reconcile(
 ) -> tuple[list[dict], list[dict]]:
     """Return (rows to insert as history, conflicts).
 
+    ``existing`` is the de-duplicated set of already accepted *late* rows
+    (default partition plus any late rows carried by an offline month table).
     A pre-existing late row wins when its content is identical; differing
     content for the same alarm number is a conflict and rejects the batch.
     """
@@ -432,6 +487,51 @@ def _reconcile(
     return list(chosen.values()), list(conflicts.values())
 
 
+def _collect_late_rows(
+    default_rows: Iterable[dict], offline_rows: Iterable[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Merge late reports from the default partition and an offline month table.
+
+    Returns ``(late_rows, conflicts)``.  The same alarm number in both places
+    with identical content yields one late row (a late report stays a late
+    report); differing content is a conflict that rejects the new batch.
+    Offline rows originally loaded as history are excluded here — a re-attach
+    replaces that history wholesale with the new CSV.
+    """
+    merged: dict[str, dict] = {}
+    conflicts: list[dict] = []
+    seen_conflict: set[str] = set()
+
+    def consider(row: dict, reason: str) -> None:
+        alarm_no = row["alarm_no"]
+        content = content_of(row["occurred_at"], row["warehouse_no"], row["temperature"])
+        if alarm_no in merged:
+            if content_of(
+                merged[alarm_no]["occurred_at"],
+                merged[alarm_no]["warehouse_no"],
+                merged[alarm_no]["temperature"],
+            ) != content and alarm_no not in seen_conflict:
+                conflicts.append(
+                    {
+                        "alarm_no": alarm_no,
+                        "reason": reason,
+                        "csv_line": None,
+                    }
+                )
+                seen_conflict.add(alarm_no)
+            return
+        merged[alarm_no] = row
+
+    # Default-partition rows are the most recently accepted late reports and
+    # take the first slot; offline late rows are then folded in.
+    for row in default_rows:
+        consider(row, "默认分区与离线月表中同号补报内容不一致")
+    for row in offline_rows:
+        if row.get("source", "late") == "late":
+            consider(row, "默认分区与离线月表中同号补报内容不一致")
+    return list(merged.values()), conflicts
+
+
 def attach_batch(batch_id: int) -> AttachResult:
     try:
         with connect() as conn:
@@ -442,6 +542,10 @@ def attach_batch(batch_id: int) -> AttachResult:
                 return AttachResult(False, "missing", "批次不存在", [])
             if batch["status"] == "attached":
                 return AttachResult(False, "attached", "该批次已挂接，未重复执行", [])
+            if batch["status"] == "superseded":
+                return AttachResult(
+                    False, "superseded", "该批次已被同月新批替代，不能再次挂接", []
+                )
             if batch["status"] == "rejected":
                 conflicts = (batch["conflict_json"] or {}).get("conflicts", [])
                 return AttachResult(
@@ -453,6 +557,7 @@ def attach_batch(batch_id: int) -> AttachResult:
 
             month_start = batch["month_start"]
             month_end = batch["month_end"]
+            part_name = partition_name(month_start)
 
             # Serialise every attach (any month) before reading the parent
             # table, so parent-table lock upgrades cannot deadlock with one
@@ -471,13 +576,29 @@ def attach_batch(batch_id: int) -> AttachResult:
                 _mark_rejected(conn, batch_id, message, [])
                 return AttachResult(False, "rejected", message, [])
 
+            # An *attached* partition for the month still blocks a second
+            # attach.  A *detached* table keeping the standard name is the
+            # re-attach case and is reinstalled below instead.
             if _existing_partition(conn, month_start):
                 message = f"{month_start:%Y-%m} 已存在月分区，拒绝重复挂接"
                 _mark_rejected(conn, batch_id, message, [])
                 return AttachResult(False, "rejected", message, [])
 
-            existing = _default_rows(conn, month_start)
-            history_rows, conflicts = _reconcile(staged, existing)
+            offline_table = _offline_month_table(conn, month_start)
+
+            # Accepted late rows live in the default partition; rows received
+            # before the earlier DETACH may still sit in the offline table.
+            # Old history rows in the offline table are intentionally ignored:
+            # the new CSV replaces that history.
+            default_rows = _default_rows(conn, month_start)
+            offline_rows = (
+                _offline_rows(conn, offline_table) if offline_table else []
+            )
+            late_rows, late_conflicts = _collect_late_rows(default_rows, offline_rows)
+            if late_conflicts:
+                return _reject_conflicts(conn, batch_id, late_conflicts)
+
+            history_rows, conflicts = _reconcile(staged, late_rows)
             if conflicts:
                 return _reject_conflicts(conn, batch_id, conflicts)
 
@@ -505,7 +626,7 @@ def attach_batch(batch_id: int) -> AttachResult:
                     upper=sql.Literal(month_end.isoformat()),
                 )
             )
-            _copy_rows(conn, build, month_start, batch["id"], existing, history_rows)
+            _copy_rows(conn, build, month_start, batch["id"], late_rows, history_rows)
 
             conn.execute(
                 "SELECT pg_advisory_xact_lock(%s)",
@@ -523,25 +644,68 @@ def attach_batch(batch_id: int) -> AttachResult:
                 )
                 return _reject_conflicts(conn, batch_id, merge_conflicts)
 
+            kept_late = conn.execute(
+                sql.SQL("SELECT count(*) AS n FROM {}").format(sql.Identifier(build))
+            ).fetchone()["n"] - len(history_rows)
+
+            if offline_table:
+                # Free the standard table/index names held by the detached
+                # table.  Everything runs in this transaction: any later
+                # failure rolls back and the offline table is back in place.
+                retired = f"alarm_retired_{month_start:%Y%m}_{batch_id}"
+                conn.execute(
+                    sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(retired))
+                )
+                # Rename constraints while the table still has its old name;
+                # renaming the table afterwards does not rename them.
+                for suffix, target in (
+                    ("_pkey", f"{retired}_pkey_constraint"),
+                    ("_month_check", f"{retired}_month_check"),
+                ):
+                    conn.execute(
+                        sql.SQL(
+                            "ALTER TABLE {part} RENAME CONSTRAINT {old} TO {new}"
+                        ).format(
+                            part=sql.Identifier(offline_table),
+                            old=sql.Identifier(offline_table + suffix),
+                            new=sql.Identifier(target),
+                        )
+                    )
+                for index, ordinal in zip(
+                    _table_index_names(conn, offline_table), range(1, 100)
+                ):
+                    conn.execute(
+                        sql.SQL("ALTER INDEX {old} RENAME TO {new}").format(
+                            old=sql.Identifier(index),
+                            new=sql.Identifier(f"{retired}_idx{ordinal}"),
+                        )
+                    )
+                conn.execute(
+                    sql.SQL("ALTER TABLE {old} RENAME TO {new}").format(
+                        old=sql.Identifier(offline_table),
+                        new=sql.Identifier(retired),
+                    )
+                )
+
             # Remove the month's rows from the default partition before
             # attaching, otherwise ATTACH PARTITION refuses overlapping rows.
             conn.execute("DELETE FROM alarm WHERE occurred_month = %s", (month_start,))
             conn.execute(
                 sql.SQL("ALTER TABLE {build} RENAME TO {part}").format(
-                    build=sql.Identifier(build), part=sql.Identifier(partition_name(month_start))
+                    build=sql.Identifier(build), part=sql.Identifier(part_name)
                 )
             )
             # Tidy the auto-generated constraint/index names to match the
             # partition, so repeated rebuilds do not leave confusing names.
             for suffix, target in (
-                ("_pkey", f"{partition_name(month_start)}_pkey"),
-                ("_month_check", f"{partition_name(month_start)}_month_check"),
+                ("_pkey", f"{part_name}_pkey"),
+                ("_month_check", f"{part_name}_month_check"),
             ):
                 conn.execute(
                     sql.SQL(
                         "ALTER TABLE {part} RENAME CONSTRAINT {old} TO {new}"
                     ).format(
-                        part=sql.Identifier(partition_name(month_start)),
+                        part=sql.Identifier(part_name),
                         old=sql.Identifier(build + suffix),
                         new=sql.Identifier(target),
                     )
@@ -549,12 +713,31 @@ def attach_batch(batch_id: int) -> AttachResult:
             conn.execute(
                 sql.SQL("ALTER TABLE alarm ATTACH PARTITION {part} "
                         "FOR VALUES FROM ({lower}) TO ({upper})").format(
-                    part=sql.Identifier(partition_name(month_start)),
+                    part=sql.Identifier(part_name),
                     lower=sql.Literal(month_start.isoformat()),
                     upper=sql.Literal(month_end.isoformat()),
                 )
             )
+            if offline_table:
+                # The new partition now carries everything worth keeping; the
+                # retired table is dropped only here, inside the same
+                # transaction, so a failure before this point leaves it whole.
+                conn.execute(
+                    sql.SQL("DROP TABLE {}").format(sql.Identifier(retired))
+                )
 
+            # A successful re-attach supersedes any previously attached batch
+            # of the same month; the new batch's success takes effect together
+            # with the new partition.
+            conn.execute(
+                """
+                UPDATE alarm_batch
+                SET status = 'superseded',
+                    error = COALESCE(error, '已被同月新批 #' || %s || ' 替代')
+                WHERE month_start = %s AND status = 'attached' AND id <> %s
+                """,
+                (batch_id, month_start, batch_id),
+            )
             conn.execute(
                 """
                 UPDATE alarm_batch
@@ -567,10 +750,14 @@ def attach_batch(batch_id: int) -> AttachResult:
             return AttachResult(
                 True,
                 "attached",
-                f"{month_start:%Y-%m} 挂接成功",
+                (
+                    f"{month_start:%Y-%m} 重挂成功，离线月表已由新批替换"
+                    if offline_table
+                    else f"{month_start:%Y-%m} 挂接成功"
+                ),
                 [],
                 inserted_history=len(history_rows),
-                kept_late=len(late_now),
+                kept_late=kept_late,
             )
     except (AttachError, psycopg.Error) as exc:
         # The transaction rolled back: the parent table is untouched and any

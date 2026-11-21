@@ -31,14 +31,15 @@ CREATE TABLE IF NOT EXISTS alarm_default PARTITION OF alarm DEFAULT;
 
 -- One row per upload batch.  A batch is only "attached" after validation and a
 -- successful ALTER TABLE ... ATTACH PARTITION.  Rejected batches are kept for
--- auditing together with their conflict report.
+-- auditing together with their conflict report.  A same-month re-attach marks
+-- the previously attached batch(es) as "superseded".
 CREATE TABLE IF NOT EXISTS alarm_batch (
     id             bigserial   PRIMARY KEY,
     month_start    date        NOT NULL,
     month_end      date        NOT NULL,
     filename       text        NOT NULL,
     status         text        NOT NULL DEFAULT 'staged'
-                               CHECK (status IN ('staged', 'rejected', 'attached')),
+                               CHECK (status IN ('staged', 'rejected', 'attached', 'superseded')),
     row_count      integer     NOT NULL DEFAULT 0,
     rejected_count integer     NOT NULL DEFAULT 0,
     conflict_json  jsonb,
@@ -46,6 +47,24 @@ CREATE TABLE IF NOT EXISTS alarm_batch (
     created_at     timestamptz NOT NULL DEFAULT now(),
     attached_at    timestamptz
 );
+
+-- Migration for databases created before same-month re-attach existed: widen
+-- the status CHECK constraint to allow "superseded".  Idempotent.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'alarm_batch_status_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%superseded%'
+    ) THEN
+        ALTER TABLE alarm_batch
+            DROP CONSTRAINT alarm_batch_status_check;
+        ALTER TABLE alarm_batch
+            ADD CONSTRAINT alarm_batch_status_check
+            CHECK (status IN ('staged', 'rejected', 'attached', 'superseded'));
+    END IF;
+END $$;
 
 -- Staging area for a batch's CSV rows.  Rows are loaded here first so that a
 -- failed attach never touches the parent table.

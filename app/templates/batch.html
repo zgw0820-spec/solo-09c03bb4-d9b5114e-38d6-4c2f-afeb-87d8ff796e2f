@@ -9,6 +9,12 @@
 </div>
 {% endif %}
 
+{% if batch.status == 'superseded' %}
+<div class="notice warn">
+  该批次曾挂接成功，后被同月新批替代，旧分区数据已由新批替换。同月重挂由当前 <code>attached</code> 批次生效。
+</div>
+{% endif %}
+
 <div class="card">
   <table>
     <tr><th style="width:34%">UTC 月份</th><td>{{ batch.month_start.strftime('%Y-%m') }}（分区键范围 {{ batch.month_start }} ~ {{ batch.month_end }}，左闭右开）</td></tr>

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ month.strftime('%Y-%m') }} 告警{% endblock %}
+{% block content %}
+<h1>{{ month.strftime('%Y-%m') }} 告警记录</h1>
+<div class="card">
+  <p>当前存储位置：<code>{{ storage }}</code></p>
+  <p class="muted">数据来自告警父表 <code>alarm</code>，包含历史批次与已接收的迟到补报。</p>
+  <p><a href="/">返回总览</a></p>
+</div>
+<div class="card scroll">
+  {% if records %}
+  <table>
+    <thead><tr><th>告警号</th><th>发生时间 (UTC)</th><th>库房号</th><th>温度</th><th>来源</th><th>批次</th><th>存储分区</th></tr></thead>
+    <tbody>
+    {% for r in records %}
+      <tr>
+        <td>{{ r.alarm_no }}</td>
+        <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td>{{ r.warehouse_no }}</td>
+        <td>{{ r.temperature }}</td>
+        <td><span class="badge {{ r.source }}">{{ '历史' if r.source == 'history' else '补报' }}</span></td>
+        <td>{{ r.batch_id or '—' }}</td>
+        <td><code>{{ r.storage }}</code></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">该月尚无告警记录。</p>
+  {% endif %}
+</div>
+{% endblock %}

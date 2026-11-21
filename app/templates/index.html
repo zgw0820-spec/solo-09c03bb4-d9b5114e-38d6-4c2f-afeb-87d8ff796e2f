@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>总览</h1>
+
+{% if request.query_params.get('attached') %}
+<div class="notice ok">批次已挂接，月分区生效。</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">上传历史告警 CSV</h2>
+  <p class="muted">选择 CSV 所属的 UTC 月份并上传。文件需包含告警号、发生时间、库房号、温度。
+    装载期间补报仍可直接提交；挂接成功前历史批次不会生效。</p>
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <div class="grid">
+      <div>
+        <label for="month">UTC 月份</label>
+        <input type="month" id="month" name="month" value="{{ default_month }}" required>
+      </div>
+      <div>
+        <label for="file">CSV 文件</label>
+        <input type="file" id="file" name="file" accept=".csv,text/csv" required>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit">上传并暂存</button>
+      <span class="muted">上传只做校验和暂存，需在批次页面确认后挂接。</span>
+    </div>
+  </form>
+</div>
+
+<h2>按月挂接状态</h2>
+<div class="card scroll">
+  {% if months %}
+  <table>
+    <thead><tr><th>UTC 月份</th><th>总条数</th><th>迟到补报</th><th>历史批次</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for m in months %}
+      <tr>
+        <td>{{ m.month.strftime('%Y-%m') }}</td>
+        <td>{{ m.total }}</td>
+        <td>{{ m.late_count }}</td>
+        <td>{{ m.history_count }}</td>
+        <td><a href="/months/{{ m.month.strftime('%Y-%m') }}">查看记录</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">告警父表暂无数据。</p>
+  {% endif %}
+</div>
+
+<h2>上传批次</h2>
+<div class="card scroll">
+  {% if batches %}
+  <table>
+    <thead><tr><th>批次</th><th>月份</th><th>文件</th><th>状态</th><th>行数</th><th>创建时间</th></tr></thead>
+    <tbody>
+    {% for b in batches %}
+      <tr>
+        <td><a href="/batches/{{ b.id }}">#{{ b.id }}</a></td>
+        <td>{{ b.month_start.strftime('%Y-%m') }}</td>
+        <td>{{ b.filename }}</td>
+        <td><span class="badge {{ b.status }}">{{ b.status }}</span></td>
+        <td>{{ b.row_count }}</td>
+        <td class="muted">{{ b.created_at.strftime('%Y-%m-%d %H:%M:%S %Z') }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有上传过批次。</p>
+  {% endif %}
+</div>
+{% endblock %}

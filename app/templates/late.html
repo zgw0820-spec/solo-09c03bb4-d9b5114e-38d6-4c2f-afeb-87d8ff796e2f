@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}补报告警{% endblock %}
+{% block content %}
+<h1>补报告警</h1>
+<p class="muted">补报直接写入告警父表：未挂接月份的告警落入默认分区，已挂接月份写入月分区。
+同月同号同内容不会重复写入，内容不一致会提示冲突。</p>
+
+{% if result %}
+  {% if result.status == 'inserted' %}
+    <div class="notice ok">告警 <code>{{ result.alarm_no }}</code> 补报成功：{{ result.detail }}</div>
+  {% elif result.status == 'duplicate' %}
+    <div class="notice warn">告警 <code>{{ result.alarm_no }}</code>：{{ result.detail }}</div>
+  {% else %}
+    <div class="notice err">告警 <code>{{ result.alarm_no }}</code>：{{ result.detail }}</div>
+  {% endif %}
+{% endif %}
+
+<div class="card">
+  <form method="post" action="/late">
+    <div class="grid">
+      <div>
+        <label for="alarm_no">告警号</label>
+        <input type="text" id="alarm_no" name="alarm_no" required
+               value="{{ form.alarm_no if form else '' }}" placeholder="例如 ALM-2026-0001">
+      </div>
+      <div>
+        <label for="occurred_at">发生时间（UTC）</label>
+        <input type="text" id="occurred_at" name="occurred_at" required
+               value="{{ form.occurred_at if form else now }}" placeholder="2026-11-03T01:15:00Z">
+        <span class="muted">可填 ISO 8601；不带时区按 UTC 处理。</span>
+      </div>
+      <div>
+        <label for="warehouse_no">库房号</label>
+        <input type="text" id="warehouse_no" name="warehouse_no" required
+               value="{{ form.warehouse_no if form else '' }}" placeholder="例如 W1">
+      </div>
+      <div>
+        <label for="temperature">温度（℃）</label>
+        <input type="text" id="temperature" name="temperature" required
+               value="{{ form.temperature if form else '' }}" placeholder="-18.5">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit">提交补报</button>
+      <a href="/">返回总览</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

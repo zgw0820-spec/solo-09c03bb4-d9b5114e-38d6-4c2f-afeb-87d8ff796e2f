@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}批次 #{{ batch.id }}{% endblock %}
+{% block content %}
+<h1>批次 #{{ batch.id }} <span class="badge {{ batch.status }}">{{ batch.status }}</span></h1>
+
+{% if batch.error %}
+<div class="notice {{ 'ok' if batch.status == 'attached' else ('warn' if batch.status == 'staged' else 'err') }}">
+  {{ batch.error }}
+</div>
+{% endif %}
+
+<div class="card">
+  <table>
+    <tr><th style="width:34%">UTC 月份</th><td>{{ batch.month_start.strftime('%Y-%m') }}（分区键范围 {{ batch.month_start }} ~ {{ batch.month_end }}，左闭右开）</td></tr>
+    <tr><th>文件</th><td>{{ batch.filename }}</td></tr>
+    <tr><th>状态</th><td><span class="badge {{ batch.status }}">{{ batch.status }}</span></td></tr>
+    <tr><th>CSV 数据行</th><td>{{ batch.row_count }}</td></tr>
+    <tr><th>暂存行数</th><td>{{ batch.staged_total }}</td></tr>
+    <tr><th>创建时间</th><td>{{ batch.created_at.strftime('%Y-%m-%d %H:%M:%S %Z') }}</td></tr>
+    <tr><th>挂接时间</th><td>{{ batch.attached_at.strftime('%Y-%m-%d %H:%M:%S %Z') if batch.attached_at else '—' }}</td></tr>
+    {% if batch.rejected_count %}
+    <tr><th>问题条数</th><td>{{ batch.rejected_count }}</td></tr>
+    {% endif %}
+  </table>
+</div>
+
+{% if conflicts %}
+<h2>挂接拒绝：告警号内容出入</h2>
+<div class="notice err">
+  以下告警号在同月内内容不一致或批次内自相矛盾，历史批次未生效。已接收的补报仍然可查，父表继续接收补报。
+</div>
+<div class="card scroll">
+  <table>
+    <thead><tr><th>告警号</th><th>原因</th><th>CSV 行号</th></tr></thead>
+    <tbody>
+    {% for c in conflicts %}
+      <tr><td><code>{{ c.alarm_no }}</code></td><td>{{ c.reason }}</td><td>{{ c.csv_line or '—' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if row_errors %}
+<h2>CSV 行校验失败</h2>
+<div class="notice err">存在无法解析的行，整个批次未暂存。</div>
+<div class="card scroll">
+  <table>
+    <thead><tr><th>行号</th><th>说明</th></tr></thead>
+    <tbody>
+    {% for e in row_errors %}
+      <tr><td>{{ e.line }}</td><td>{{ e.message }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if batch.status == 'staged' %}
+<h2>暂存数据（最多显示 500 行）</h2>
+<div class="card scroll">
+  <table>
+    <thead><tr><th>行号</th><th>告警号</th><th>发生时间 (UTC)</th><th>库房号</th><th>温度</th></tr></thead>
+    <tbody>
+    {% for r in batch.staged_rows %}
+      <tr>
+        <td>{{ r.line_no }}</td>
+        <td>{{ r.alarm_no }}</td>
+        <td>{{ r.occurred_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td>{{ r.warehouse_no }}</td>
+        <td>{{ r.temperature }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="actions">
+  <form method="post" action="/batches/{{ batch.id }}/attach">
+    <button type="submit">挂接月分区</button>
+  </form>
+  <a href="/">返回总览</a>
+</div>
+{% else %}
+<div class="actions">
+  <a href="/months/{{ batch.month_start.strftime('%Y-%m') }}">查看该月记录</a>
+  <a href="/">返回总览</a>
+</div>
+{% endif %}
+{% endblock %}
